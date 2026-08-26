@@ -1,0 +1,34 @@
+env:
+  id: HalfCheetah-v5
+  seed: 0
+  render_size: 96
+collect:
+  transitions: 30000
+lewm:
+  latent_dim: 256
+  hidden_dim: 512
+  sigreg_lambda: 0.1
+  sigreg_projections: 512
+  sigreg_knots: 17
+  batch_size: 256
+  epochs: 40
+  lr: 0.0003
+reward_probe:
+  epochs: 20
+  lr: 0.001
+mpc:
+  horizon: 18
+  candidates: 3072
+  elites: 192
+  iterations: 5
+  init_std: 0.7
+  min_std: 0.05
+  discount: 0.99
+eval:
+  episodes: 10
+hardware:
+  profile: RTX 5090 32GB
+  precision: bf16
+  allow_tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high

@@ -1,0 +1,28 @@
+env:
+  id: HalfCheetah-v5
+  seed: 0
+  render_size: 96
+collect:
+  transitions: 12000
+lewm:
+  latent_dim: 128
+  hidden_dim: 256
+  sigreg_lambda: 0.1
+  sigreg_projections: 256
+  sigreg_knots: 17
+  batch_size: 64
+  epochs: 30
+  lr: 0.0003
+reward_probe:
+  epochs: 20
+  lr: 0.001
+mpc:
+  horizon: 12
+  candidates: 256
+  elites: 32
+  iterations: 4
+  init_std: 0.7
+  min_std: 0.05
+  discount: 0.99
+eval:
+  episodes: 5

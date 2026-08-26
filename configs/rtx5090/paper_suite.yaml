@@ -1,0 +1,21 @@
+tasks:
+- configs/rtx5090/hopper.yaml
+- configs/rtx5090/walker2d.yaml
+- configs/rtx5090/halfcheetah.yaml
+methods:
+- mpc_only
+- action_residual
+- zprl_style
+- planning_residual
+seeds:
+- 0
+- 1
+- 2
+- 3
+- 4
+steps: 100000
+lewm_configs:
+- configs/rtx5090/lewm_hopper.yaml
+- configs/rtx5090/lewm_walker2d.yaml
+- configs/rtx5090/lewm_halfcheetah.yaml
+run_lewm: false

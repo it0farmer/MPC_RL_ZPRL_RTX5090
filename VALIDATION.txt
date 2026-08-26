@@ -1,0 +1,4 @@
+Validation date: 2026-08-25
+python -m compileall -q mpcrl experiments tests: PASS
+python -m unittest discover -s tests -v: 6 tests PASS
+Note: container lacks gymnasium/mujoco, so MuJoCo runtime was not executed here; core algorithm modules were unit-tested with PyTorch CPU.

@@ -1,0 +1,32 @@
+RTX 5090 optimized revision validation
+======================================
+
+Changes validated:
+- EMA z-score uncertainty gate
+- Residual linear ramp
+- One-step MPC plan cache
+- 10k three-method diagnostic suite
+
+Static validation:
+python -m compileall -q mpcrl experiments tests
+PASS
+
+Unit validation:
+python -m unittest discover -s tests -v
+Ran 9 tests
+OK
+
+Gate sanity check using uncertainty values observed on RTX 5090 smoke run:
+uncertainty 0.13448 -> initial adaptive gate ~= 0.339
+uncertainty 0.15047 -> adaptive gate ~= 0.440
+The gate therefore no longer saturates near 1.0 at the observed uncertainty scale.
+
+Runtime environment previously verified by user:
+PyTorch 2.11.0+cu128
+CUDA runtime 12.8
+GPU NVIDIA GeForce RTX 5090
+Compute capability 12.0
+VRAM ~31.36 GiB
+BF16 supported True
+Original 6 core tests PASS
+MuJoCo HalfCheetah-v5 2000-step smoke training PASS

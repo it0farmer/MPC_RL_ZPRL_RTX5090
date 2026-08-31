@@ -41,6 +41,7 @@ residual:
   ramp_steps: 5000
   fixed_gate: 1.0
   consistency_coef: 0.05
+  temporal_decay: 0.8
 sac:
   hidden_dim: 512
   lr: 0.0003
@@ -56,3 +57,9 @@ hardware:
   allow_tf32: true
   cudnn_benchmark: true
   matmul_precision: high
+zprl_style:
+  bc_collect_steps: 6000
+  bc_epochs: 80
+  latent_dim: 16
+  residual_ramp_steps: 5000
+  residual_scale: 0.05

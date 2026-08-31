@@ -34,13 +34,14 @@ residual:
   gate_mode: running_zscore
   gate_momentum: 0.995
   gate_initial_std: 0.05
-  gate_z_threshold: 0.5
-  gate_z_temperature: 0.75
-  gate_min: 0.05
-  gate_max: 0.95
+  gate_z_threshold: 0.0
+  gate_z_temperature: 1.0
+  gate_min: 0.15
+  gate_max: 0.9
   ramp_steps: 5000
   fixed_gate: 1.0
-  consistency_coef: 0.05
+  consistency_coef: 0.03
+  temporal_decay: 0.75
 sac:
   hidden_dim: 512
   lr: 0.0003
@@ -56,3 +57,9 @@ hardware:
   allow_tf32: true
   cudnn_benchmark: true
   matmul_precision: high
+zprl_style:
+  bc_collect_steps: 6000
+  bc_epochs: 80
+  latent_dim: 16
+  residual_ramp_steps: 5000
+  residual_scale: 0.05

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from pathlib import Path
 
@@ -25,6 +26,108 @@ def _pbar(iterable, enabled=True, **kwargs):
     return tqdm(iterable, disable=not enabled, dynamic_ncols=True, mininterval=0.5, **kwargs)
 
 
+def _save_rng_state():
+    return {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch_cpu': torch.random.get_rng_state(),
+        'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(state):
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.random.set_rng_state(state['torch_cpu'])
+    if state['torch_cuda'] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state['torch_cuda'])
+
+
+def evaluate_zprl(
+    cfg,
+    base,
+    agent,
+    device,
+    low,
+    high,
+    mid,
+    span,
+    latent_residual_scale,
+    train_seed,
+    episodes,
+    show_progress=True,
+):
+    if episodes <= 0:
+        return []
+
+    rng_state = _save_rng_state()
+    env, _, _ = make_mujoco_env(cfg['env']['id'], train_seed + 20000)
+    rows = []
+    try:
+        ep_iter = _pbar(
+            range(episodes),
+            show_progress,
+            total=episodes,
+            desc=f"final eval {cfg['env']['id']} | zprl_style | seed={train_seed}",
+            leave=False,
+            unit='ep',
+        )
+        for ep in ep_iter:
+            eval_seed = 200000 + train_seed * 1000 + ep
+            random.seed(eval_seed)
+            np.random.seed(eval_seed)
+            torch.manual_seed(eval_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(eval_seed)
+
+            obs, _ = env.reset(seed=eval_seed)
+            done = False
+            info = {}
+            em = EpisodeMetrics()
+
+            while not done:
+                ot = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                with torch.no_grad():
+                    z = base.encode(ot).squeeze(0).cpu().numpy()
+                c = np.concatenate([obs, z])
+                dz = agent.act(c, deterministic=True)
+                effective_dz = latent_residual_scale * dz
+                z2 = torch.as_tensor(
+                    z + effective_dz, dtype=torch.float32, device=device
+                ).unsqueeze(0)
+                with torch.no_grad():
+                    an = base.decode(z2).squeeze(0).cpu().numpy()
+                action = np.clip(mid + span * an, low, high)
+
+                no, r, te, tr, info = env.step(action)
+                done = te or tr
+                em.step(
+                    r,
+                    action,
+                    resnorm=float(np.linalg.norm(dz)),
+                    effective_resnorm=float(np.linalg.norm(effective_dz)),
+                    gate=1.0,
+                    ramp=1.0,
+                )
+                obs = no
+
+            row = em.finish(info, cfg['env'].get('success_return_threshold'))
+            row.update({
+                'eval_episode': ep,
+                'eval_seed': eval_seed,
+                'train_seed': train_seed,
+                'method': 'zprl_style',
+                'env': cfg['env']['id'],
+            })
+            rows.append(row)
+            if show_progress:
+                ep_iter.set_postfix(ret=f"{row['episode_return']:.1f}", length=row['episode_length'])
+    finally:
+        env.close()
+        _restore_rng_state(rng_state)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default='configs/halfcheetah.yaml')
@@ -33,6 +136,7 @@ def main():
     ap.add_argument('--latent-dim', type=int)
     ap.add_argument('--bc-collect-steps', type=int)
     ap.add_argument('--bc-epochs', type=int)
+    ap.add_argument('--eval-episodes', type=int)
     ap.add_argument('--no-progress', action='store_true')
     args = ap.parse_args()
 
@@ -93,9 +197,6 @@ def main():
         m['alpha'], m['init_std'], m['min_std'], m['discount'], w.get('uncertainty_penalty', 0.0)
     )
 
-    # Build the frozen base policy from states actually visited by MPC rather
-    # than random warmup states. This is the critical prerequisite for a fair
-    # bottleneck-residual baseline: RL should refine a competent base policy.
     bc_states = []
     bc_targets = []
     obs, _ = env.reset(seed=seed + 101)
@@ -265,6 +366,29 @@ def main():
         },
         out / 'final.pt',
     )
+
+    n_eval = int(tc.get('final_eval_episodes', 3) if args.eval_episodes is None else args.eval_episodes)
+    eval_rows = evaluate_zprl(
+        cfg, base, agent, device, low, high, mid, span,
+        latent_residual_scale, seed, n_eval, show_progress,
+    )
+    if eval_rows:
+        eval_fields = [
+            'eval_episode', 'eval_seed', 'train_seed', 'method', 'env',
+            'episode_return', 'episode_length', 'success', 'mpc_ms',
+            'prediction_mse', 'uncertainty', 'residual_norm',
+            'effective_residual_norm', 'gate', 'residual_ramp',
+            'action_d1', 'action_d2',
+        ]
+        elog = CSVLogger(str(out / 'eval.csv'), eval_fields)
+        for row in eval_rows:
+            elog.write(row)
+        vals = np.asarray([r['episode_return'] for r in eval_rows], dtype=float)
+        print(
+            f"FINAL_EVAL method=zprl_style seed={seed} episodes={len(vals)} "
+            f"return={vals.mean():.3f}±{vals.std(ddof=1) if len(vals)>1 else 0.0:.3f}"
+        )
+
     env.close()
     print('output:', out)
 

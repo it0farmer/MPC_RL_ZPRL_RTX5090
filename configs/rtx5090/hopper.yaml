@@ -11,6 +11,7 @@ train:
   rl_start_steps: 6000
   rl_updates_per_step: 1
   eval_interval: 5000
+  final_eval_episodes: 3
   checkpoint_interval: 10000
 world_model:
   ensemble_size: 7
@@ -38,6 +39,7 @@ residual:
   gate_z_temperature: 1.0
   gate_min: 0.15
   gate_max: 0.9
+  gate_power: 1.0
   ramp_steps: 5000
   fixed_gate: 1.0
   consistency_coef: 0.03

@@ -34,11 +34,12 @@ residual:
   gate_mode: running_zscore
   gate_momentum: 0.995
   gate_initial_std: 0.05
-  gate_z_threshold: 0.5
+  gate_z_threshold: 0.25
   gate_z_temperature: 0.75
-  gate_min: 0.05
-  gate_max: 0.95
-  ramp_steps: 5000
+  gate_min: 0.08
+  gate_max: 0.9
+  gate_power: 1.0
+  ramp_steps: 4000
   fixed_gate: 1.0
   consistency_coef: 0.05
   temporal_decay: 0.8

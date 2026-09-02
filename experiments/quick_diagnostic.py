@@ -33,13 +33,13 @@ def numeric_last(g, col):
     return float(s.iloc[-1]) if len(s) else np.nan
 
 
-def build_summary(df, requested_steps):
+def build_summary(train_df, eval_df, requested_steps):
     rows = []
-    for (method, seed), g in df.groupby(['method', 'seed'], dropna=False):
+    for (method, seed), g in train_df.groupby(['method', 'seed'], dropna=False):
         g = g.sort_values('global_step')
         ret = pd.to_numeric(g['episode_return'], errors='coerce')
         final_logged_step = int(pd.to_numeric(g['global_step'], errors='coerce').max())
-        rows.append({
+        row = {
             'method': method,
             'seed': int(seed),
             'episodes': int(len(g)),
@@ -60,38 +60,68 @@ def build_summary(df, requested_steps):
             'residual_ramp_mean': numeric_mean(g, 'residual_ramp'),
             'mpc_cache_hit_rate_mean': numeric_mean(g, 'mpc_cache_hit_rate'),
             'wm_loss_last': numeric_last(g, 'wm_loss'),
-        })
+        }
+
+        if len(eval_df):
+            e = eval_df[
+                (eval_df['method'] == method)
+                & (pd.to_numeric(eval_df['train_seed'], errors='coerce') == int(seed))
+            ]
+            er = pd.to_numeric(e.get('episode_return'), errors='coerce').dropna()
+            if len(er):
+                row.update({
+                    'eval_episodes': int(len(er)),
+                    'eval_return_mean': float(er.mean()),
+                    'eval_return_std': float(er.std(ddof=1)) if len(er) > 1 else 0.0,
+                    'eval_return_min': float(er.min()),
+                    'eval_return_max': float(er.max()),
+                    'eval_length_mean': numeric_mean(e, 'episode_length'),
+                    'eval_prediction_mse_mean': numeric_mean(e, 'prediction_mse'),
+                    'eval_action_d1_mean': numeric_mean(e, 'action_d1'),
+                    'eval_gate_mean': numeric_mean(e, 'gate'),
+                })
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
 def build_comparison(per_seed):
-    metric = 'return_last5_mean'
+    if 'eval_return_mean' in per_seed and per_seed['eval_return_mean'].notna().any():
+        metric = 'eval_return_mean'
+        source = 'deterministic_final_eval'
+    else:
+        metric = 'return_last5_mean'
+        source = 'training_last5_fallback'
+
     rows = []
-    base = per_seed[per_seed['method'] == 'mpc_only'][metric]
+    base = pd.to_numeric(
+        per_seed.loc[per_seed['method'] == 'mpc_only', metric],
+        errors='coerce',
+    ).dropna()
     base_mean = float(base.mean()) if len(base) else np.nan
+
     for method, g in per_seed.groupby('method'):
-        vals = pd.to_numeric(g[metric], errors='coerce')
-        mean = float(vals.mean())
+        vals = pd.to_numeric(g[metric], errors='coerce').dropna()
+        mean = float(vals.mean()) if len(vals) else np.nan
         std = float(vals.std(ddof=1)) if len(vals) > 1 else np.nan
         rel = (
             (mean - base_mean) / max(abs(base_mean), 1e-9) * 100.0
-            if np.isfinite(base_mean) else np.nan
+            if np.isfinite(base_mean) and np.isfinite(mean)
+            else np.nan
         )
         rows.append({
             'method': method,
+            'performance_source': source,
             'seeds': int(len(vals)),
-            'last5_return_mean': mean,
-            'last5_return_std': std,
+            'return_mean': mean,
+            'return_std_across_seeds': std,
             'vs_mpc_pct': rel,
         })
-    return pd.DataFrame(rows).sort_values('last5_return_mean', ascending=False)
+    return pd.DataFrame(rows).sort_values('return_mean', ascending=False)
 
 
 def plot_metrics(df, outdir):
     set_paper_style()
     outdir.mkdir(parents=True, exist_ok=True)
-    # Use English labels on headless Ubuntu to avoid repeated CJK glyph warnings
-    # when Songti/Noto CJK is not installed on the server.
     metrics = [
         ('episode_return', 'Episode return'),
         ('mpc_ms', 'MPC planning time / ms'),
@@ -125,11 +155,38 @@ def plot_metrics(df, outdir):
         plt.close(fig)
 
 
+def plot_eval(eval_df, outdir):
+    if not len(eval_df):
+        return
+    set_paper_style()
+    outdir.mkdir(parents=True, exist_ok=True)
+    q = (
+        eval_df.groupby(['method', 'train_seed'], as_index=False)['episode_return']
+        .mean()
+    )
+    methods = list(q['method'].drop_duplicates())
+    x = np.arange(len(methods))
+    means, stds = [], []
+    for method in methods:
+        vals = q.loc[q.method == method, 'episode_return'].astype(float)
+        means.append(vals.mean())
+        stds.append(vals.std(ddof=1) if len(vals) > 1 else 0.0)
+    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    ax.bar(x, means, yerr=stds, capsize=4)
+    ax.set_xticks(x, methods, rotation=15)
+    ax.set_ylabel('Deterministic final evaluation return')
+    ax.grid(axis='y', alpha=.25)
+    fig.tight_layout()
+    fig.savefig(outdir / 'final_eval_return.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--config', default='configs/rtx5090/halfcheetah.yaml')
     p.add_argument('--steps', type=int, default=10000)
     p.add_argument('--seeds', type=int, nargs='+', default=[0])
+    p.add_argument('--eval-episodes', type=int, default=3)
     p.add_argument('--tag')
     a = p.parse_args()
 
@@ -151,20 +208,32 @@ def main():
                 '--steps', str(a.steps),
                 '--seed', str(seed),
                 '--run-name', name,
+                '--eval-episodes', str(a.eval_episodes),
             ])
             run_dirs.append(root / name)
 
-    frames = []
+    train_frames = []
+    eval_frames = []
     for d in run_dirs:
         f = d / 'episodes.csv'
         q = pd.read_csv(f)
         q['run_dir'] = str(d)
-        frames.append(q)
+        train_frames.append(q)
 
-    df = pd.concat(frames, ignore_index=True)
-    df.to_csv(outdir / 'episodes_all.csv', index=False)
+        ef = d / 'eval.csv'
+        if ef.exists():
+            e = pd.read_csv(ef)
+            e['run_dir'] = str(d)
+            eval_frames.append(e)
 
-    per_seed = build_summary(df, a.steps)
+    train_df = pd.concat(train_frames, ignore_index=True)
+    eval_df = pd.concat(eval_frames, ignore_index=True) if eval_frames else pd.DataFrame()
+
+    train_df.to_csv(outdir / 'episodes_all.csv', index=False)
+    if len(eval_df):
+        eval_df.to_csv(outdir / 'eval_all.csv', index=False)
+
+    per_seed = build_summary(train_df, eval_df, a.steps)
     per_seed.to_csv(outdir / 'summary_per_seed.csv', index=False)
 
     comparison = build_comparison(per_seed)
@@ -174,11 +243,12 @@ def main():
     aggregate = per_seed.groupby('method')[numeric_cols].agg(['mean', 'std'])
     aggregate.to_csv(outdir / 'summary_mean_std.csv')
 
-    plot_metrics(df, outdir / 'figures')
+    plot_metrics(train_df, outdir / 'figures')
+    plot_eval(eval_df, outdir / 'figures')
 
     print('\nPer-seed summary:')
     print(per_seed.to_string(index=False))
-    print('\nFinal-window comparison (last 5 completed episodes per seed):')
+    print('\nFinal comparison:')
     print(comparison.to_string(index=False))
     print('Saved:', outdir)
 

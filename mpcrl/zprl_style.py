@@ -10,6 +10,8 @@ from tqdm.auto import tqdm
 class BottleneckBasePolicy(nn.Module):
     def __init__(self, obs_dim, action_dim, latent_dim=16, hidden=256):
         super().__init__()
+        self.register_buffer('obs_mean', torch.zeros(obs_dim, dtype=torch.float32))
+        self.register_buffer('obs_std', torch.ones(obs_dim, dtype=torch.float32))
         self.encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
@@ -22,8 +24,23 @@ class BottleneckBasePolicy(nn.Module):
             nn.Tanh(),
         )
 
+    @torch.no_grad()
+    def set_obs_normalizer(self, obs):
+        x = torch.as_tensor(obs, dtype=torch.float32, device=self.obs_mean.device)
+        if x.ndim != 2 or x.shape[1] != self.obs_mean.numel():
+            raise ValueError(
+                f'expected observation array [N,{self.obs_mean.numel()}], got {tuple(x.shape)}'
+            )
+        self.obs_mean.copy_(x.mean(dim=0))
+        self.obs_std.copy_(x.std(dim=0, unbiased=False).clamp_min(1e-3))
+
+    def normalize_obs(self, obs):
+        # Clipping only protects the clone from rare OOD spikes; the training
+        # distribution remains effectively unchanged after standardization.
+        return ((obs - self.obs_mean) / self.obs_std).clamp(-10.0, 10.0)
+
     def encode(self, obs):
-        return self.encoder(obs)
+        return self.encoder(self.normalize_obs(obs))
 
     def decode(self, z):
         return self.decoder(z)
@@ -41,21 +58,28 @@ def fit_behavior_clone(
     lr=1e-3,
     device='cpu',
     show_progress=True,
+    update_obs_stats=True,
 ):
-    """Train the frozen ZPRL-style base policy on an MPC rollout dataset.
+    """Fit/refit the ZPRL-style base policy on an expert action dataset.
 
-    ``epochs`` is a true full-dataset epoch count (the previous implementation
-    performed only one random mini-batch update per epoch, which severely
-    underfit the base policy). The returned value is the final epoch MSE.
+    The clone uses full-dataset epochs and observation standardization. The
+    function can be called repeatedly after DAgger-style dataset aggregation;
+    parameters are temporarily unfrozen for each refit and frozen afterwards.
     """
     policy.to(device)
-    opt = torch.optim.Adam(policy.parameters(), lr=lr)
+    for p in policy.parameters():
+        p.requires_grad_(True)
+    policy.train()
+
     o = torch.as_tensor(obs, dtype=torch.float32, device=device)
     a = torch.as_tensor(target_action_norm, dtype=torch.float32, device=device)
     n = len(o)
     if n == 0:
         raise ValueError('behavior-clone dataset is empty')
+    if update_obs_stats:
+        policy.set_obs_normalizer(o)
 
+    opt = torch.optim.Adam(policy.parameters(), lr=lr)
     batch_size = max(1, min(int(batch_size), n))
     losses = []
     iterator = tqdm(

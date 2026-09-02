@@ -11,7 +11,7 @@ import torch
 from tqdm.auto import tqdm
 
 from mpcrl.cem import CEMPlanner
-from mpcrl.config import load_yaml
+from mpcrl.config import load_yaml, save_yaml
 from mpcrl.envs import action_bounds, dims, make_mujoco_env
 from mpcrl.gate import residual_ramp
 from mpcrl.metrics import CSVLogger, EpisodeMetrics
@@ -41,6 +41,117 @@ def _restore_rng_state(state):
     torch.random.set_rng_state(state['torch_cpu'])
     if state['torch_cuda'] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state['torch_cuda'])
+
+
+def _normalized_obs(base, obs, device):
+    with torch.no_grad():
+        ot = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        return base.normalize_obs(ot).squeeze(0).cpu().numpy()
+
+
+def _latent(base, obs, device):
+    with torch.no_grad():
+        ot = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        return base.encode(ot).squeeze(0).cpu().numpy()
+
+
+def _context(base, obs, z, ramp, device):
+    return np.concatenate([
+        _normalized_obs(base, obs, device),
+        z,
+        np.asarray([ramp], dtype=np.float32),
+    ]).astype(np.float32, copy=False)
+
+
+def _base_action(base, obs, device, mid, span, low, high):
+    with torch.no_grad():
+        ot = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        an = base(ot).squeeze(0).cpu().numpy()
+    return np.clip(mid + span * an, low, high)
+
+
+def _dataset_mse(base, states, targets_norm, device):
+    with torch.no_grad():
+        pred = base(torch.as_tensor(states, dtype=torch.float32, device=device)).cpu().numpy()
+    return float(np.mean((pred - targets_norm) ** 2))
+
+
+def _dagger_refine(
+    cfg,
+    base,
+    planner,
+    env,
+    states,
+    targets,
+    device,
+    low,
+    high,
+    mid,
+    span,
+    seed,
+    rounds,
+    steps_per_round,
+    refit_epochs,
+    show_progress,
+):
+    """Small DAgger-style correction for BC covariate shift.
+
+    The learner visits states using its own current base policy, while MPC only
+    labels those visited states. The aggregated dataset is then used to refit
+    the same bottleneck policy. This is intentionally lightweight: it improves
+    coverage without turning ZPRL-style training into full online MPC control.
+    """
+    if rounds <= 0 or steps_per_round <= 0:
+        return states, targets, np.nan
+
+    batch_size = int(cfg['train']['batch_size'])
+    bc_loss = np.nan
+    for rd in range(rounds):
+        extra_states = []
+        extra_targets = []
+        obs, _ = env.reset(seed=seed + 303 + rd)
+        planner.reset()
+        iterator = _pbar(
+            range(steps_per_round),
+            show_progress,
+            total=steps_per_round,
+            desc=f'ZPRL DAgger {rd + 1}/{rounds}',
+            leave=False,
+        )
+        for _ in iterator:
+            plan = planner.plan(obs)
+            expert_action = np.clip(plan.actions[0], low, high)
+            learner_action = _base_action(base, obs, device, mid, span, low, high)
+            extra_states.append(obs.copy())
+            extra_targets.append(expert_action.copy())
+
+            no, _, te, tr, _ = env.step(learner_action)
+            if te or tr:
+                obs, _ = env.reset()
+                planner.reset()
+            else:
+                obs = no
+
+        states = np.concatenate([
+            states,
+            np.asarray(extra_states, dtype=np.float32),
+        ], axis=0)
+        targets = np.concatenate([
+            targets,
+            np.asarray(extra_targets, dtype=np.float32),
+        ], axis=0)
+        targets_norm = np.clip((targets - mid) / np.maximum(span, 1e-6), -1, 1)
+        bc_loss = fit_behavior_clone(
+            base,
+            states,
+            targets_norm,
+            epochs=refit_epochs,
+            batch_size=batch_size,
+            device=device,
+            show_progress=show_progress,
+            update_obs_stats=True,
+        )
+    return states, targets, bc_loss
 
 
 def evaluate_zprl(
@@ -86,10 +197,8 @@ def evaluate_zprl(
             em = EpisodeMetrics()
 
             while not done:
-                ot = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                with torch.no_grad():
-                    z = base.encode(ot).squeeze(0).cpu().numpy()
-                c = np.concatenate([obs, z])
+                z = _latent(base, obs, device)
+                c = _context(base, obs, z, 1.0, device)
                 dz = agent.act(c, deterministic=True)
                 effective_dz = latent_residual_scale * dz
                 z2 = torch.as_tensor(
@@ -143,6 +252,7 @@ def main():
     show_progress = not args.no_progress
     cfg = load_yaml(args.config)
     seed = args.seed if args.seed is not None else cfg['env']['seed']
+    cfg['env']['seed'] = seed
     set_seed(seed)
 
     hw = cfg.get('hardware', {})
@@ -163,8 +273,15 @@ def main():
     bc_epochs = int(args.bc_epochs or zc.get('bc_epochs', 80))
     latent_residual_scale = float(zc.get('residual_scale', 0.05))
     latent_ramp_steps = int(zc.get('residual_ramp_steps', 5000))
+    dagger_rounds = int(zc.get('dagger_rounds', 0))
+    dagger_steps = int(zc.get('dagger_steps_per_round', 0))
+    dagger_epochs = int(zc.get('dagger_refit_epochs', 30))
 
-    buf = TransitionReplay(max(100000, int(args.steps) + bc_collect_steps + 10000), od, ad)
+    buf = TransitionReplay(
+        max(100000, int(args.steps) + bc_collect_steps + dagger_rounds * dagger_steps + 10000),
+        od,
+        ad,
+    )
     warm = int(tc['warmup_steps'])
     for _ in _pbar(
         range(warm),
@@ -248,12 +365,37 @@ def main():
         show_progress=show_progress,
     )
 
-    with torch.no_grad():
-        pred = base(torch.as_tensor(states, dtype=torch.float32, device=device)).cpu().numpy()
-    bc_dataset_mse = float(np.mean((pred - target_norm) ** 2))
-    print(f'ZPRL base-policy BC: samples={len(states)} final_mse={bc_dataset_mse:.6f}')
+    states, targets, dagger_bc = _dagger_refine(
+        cfg,
+        base,
+        planner,
+        env,
+        states,
+        targets,
+        device,
+        low,
+        high,
+        mid,
+        span,
+        seed,
+        dagger_rounds,
+        dagger_steps,
+        dagger_epochs,
+        show_progress,
+    )
+    if np.isfinite(dagger_bc):
+        bc = dagger_bc
+    target_norm = np.clip((targets - mid) / np.maximum(span, 1e-6), -1, 1)
+    bc_dataset_mse = _dataset_mse(base, states, target_norm, device)
+    print(
+        f'ZPRL base-policy BC: samples={len(states)} final_mse={bc_dataset_mse:.6f} '
+        f'dagger={dagger_rounds}x{dagger_steps}'
+    )
 
-    ctx_dim = od + latent_dim
+    # The critic must observe ramp because the executed latent perturbation is
+    # ramp * residual_scale * dz. Omitting it makes the transition model seen
+    # by SAC non-stationary during the ramp-up phase.
+    ctx_dim = od + latent_dim + 1
     agent = ResidualSAC(
         ctx_dim,
         latent_dim,
@@ -271,6 +413,7 @@ def main():
 
     out = Path(cfg['logging']['root']) / f"{cfg['env']['id']}__zprl_style__seed{seed}__{int(time.time())}"
     out.mkdir(parents=True, exist_ok=True)
+    save_yaml(cfg, out / 'config.yaml')
     fields = [
         'global_step', 'episode', 'method', 'env', 'seed', 'episode_return',
         'episode_length', 'success', 'mpc_ms', 'prediction_mse', 'uncertainty',
@@ -290,11 +433,10 @@ def main():
     )
 
     for step in pbar:
-        ot = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        z = base.encode(ot).squeeze(0).detach().cpu().numpy()
-        c = np.concatenate([obs, z])
-        dz = agent.act(c)
         ramp = residual_ramp(step, 1, latent_ramp_steps)
+        z = _latent(base, obs, device)
+        c = _context(base, obs, z, ramp, device)
+        dz = agent.act(c)
         effective_dz = ramp * latent_residual_scale * dz
         z2 = torch.as_tensor(z + effective_dz, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -307,11 +449,9 @@ def main():
         if done:
             nc = np.zeros(ctx_dim, np.float32)
         else:
-            with torch.no_grad():
-                nz = base.encode(
-                    torch.as_tensor(no, dtype=torch.float32, device=device).unsqueeze(0)
-                ).squeeze(0).cpu().numpy()
-            nc = np.concatenate([no, nz])
+            next_ramp = residual_ramp(step + 1, 1, latent_ramp_steps)
+            nz = _latent(base, no, device)
+            nc = _context(base, no, nz, next_ramp, device)
 
         rb.add(c, dz, r, nc, done)
         em.step(
@@ -363,6 +503,7 @@ def main():
             'latent_dim': latent_dim,
             'config': cfg,
             'bc_dataset_mse': bc_dataset_mse,
+            'context_dim': ctx_dim,
         },
         out / 'final.pt',
     )

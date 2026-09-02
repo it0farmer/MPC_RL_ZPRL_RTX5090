@@ -34,8 +34,10 @@ def load_runs(root):
         if df.empty:
             continue
         last = df.iloc[-1]
+        run_dir = Path(f).parent
         records.append({
             'path': f,
+            'run_dir': run_dir,
             'env': str(last['env']),
             'method': str(last['method']),
             'seed': int(float(last['seed'])),
@@ -47,11 +49,7 @@ def load_runs(root):
 
 
 def choose_one_run_per_seed(records):
-    """Avoid double-counting repeated/restarted runs.
-
-    Prefer the run with the largest completed global_step. If two runs reached
-    the same step, keep the newest file.
-    """
+    """Avoid double-counting repeated/restarted runs."""
     best = {}
     for r in records:
         key = (r['env'], r['method'], r['seed'])
@@ -61,12 +59,27 @@ def choose_one_run_per_seed(records):
     return list(best.values())
 
 
+def read_eval(run_dir):
+    path = Path(run_dir) / 'eval.csv'
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    return df if len(df) else None
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--root', default='runs')
     p.add_argument('--out', default='results/summary.csv')
-    p.add_argument('--tail', type=int, default=20,
-                   help='aggregate the final N episodes of each selected run')
+    p.add_argument(
+        '--tail',
+        type=int,
+        default=20,
+        help='training-episode fallback window when eval.csv is absent',
+    )
     a = p.parse_args()
 
     records = choose_one_run_per_seed(load_runs(a.root))
@@ -81,14 +94,22 @@ def main():
     ]
     rows = []
     for r in records:
-        g = r['df'].tail(max(1, int(a.tail))).reset_index(drop=True)
+        eval_df = read_eval(r['run_dir'])
+        if eval_df is not None:
+            g = eval_df.reset_index(drop=True)
+            source = 'deterministic_final_eval'
+        else:
+            g = r['df'].tail(max(1, int(a.tail))).reset_index(drop=True)
+            source = f'training_tail_{max(1, int(a.tail))}'
+
         row = {
             'env': r['env'],
             'method': r['method'],
             'seed': r['seed'],
             'global_step': r['max_step'],
             'episodes_used': len(g),
-            'run_path': r['path'],
+            'performance_source': source,
+            'run_path': str(r['run_dir']),
         }
         for col in cols:
             row[col] = (
@@ -104,10 +125,26 @@ def main():
     per_seed_path = out.with_name(out.stem + '_per_seed.csv')
     per_seed.to_csv(per_seed_path, index=False)
 
-    numeric = [c for c in per_seed.columns if c not in {'env', 'method', 'run_path'}]
-    summary = per_seed.groupby(['env', 'method'], dropna=False)[numeric].agg(['mean', 'std']).reset_index()
+    numeric = [
+        c for c in per_seed.columns
+        if c not in {'env', 'method', 'performance_source', 'run_path'}
+        and pd.api.types.is_numeric_dtype(per_seed[c])
+    ]
+    summary = (
+        per_seed.groupby(['env', 'method'], dropna=False)[numeric]
+        .agg(['mean', 'std'])
+        .reset_index()
+    )
     summary.to_csv(out, index=False)
-    print(per_seed[['env', 'method', 'seed', 'global_step', 'episode_return', 'episode_length']].to_string(index=False))
+
+    print(
+        per_seed[
+            [
+                'env', 'method', 'seed', 'global_step',
+                'performance_source', 'episode_return', 'episode_length',
+            ]
+        ].to_string(index=False)
+    )
     print('\nmean±std summary:\n', summary.to_string(index=False))
     print('saved', out)
     print('saved', per_seed_path)

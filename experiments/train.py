@@ -17,6 +17,7 @@ from mpcrl.metrics import CSVLogger, EpisodeMetrics
 from mpcrl.plan_cache import PlanCache
 from mpcrl.planning_residual import expand_temporal_residual
 from mpcrl.replay import ResidualReplay, TransitionReplay
+from mpcrl.residual_context import gated_strength, residual_context
 from mpcrl.sac import ResidualSAC
 from mpcrl.utils import accelerator_summary, configure_accelerator, set_seed
 from mpcrl.world_model import EnsembleWorldModel
@@ -32,15 +33,23 @@ def plan_chunk(plan_actions, k):
     return p
 
 
-def context(obs, chunk):
-    return np.concatenate([
-        obs.astype(np.float32),
-        chunk.reshape(-1).astype(np.float32),
-    ])
-
-
 def _progress(iterable, enabled: bool, **kwargs):
     return tqdm(iterable, disable=not enabled, dynamic_ncols=True, mininterval=0.5, **kwargs)
+
+
+def _adaptive_gate_for_plan(method, rc, normalized_gate, uncertainty, update=True):
+    if method != 'planning_residual':
+        return float(rc.get('fixed_gate', 1.0)), np.nan
+    if not rc.get('adaptive_gate', True):
+        return float(rc.get('fixed_gate', 1.0)), np.nan
+    if normalized_gate is not None:
+        gout = normalized_gate(uncertainty, update=update)
+        return gout.value, gout.normalized_uncertainty
+    return adaptive_uncertainty_gate(
+        uncertainty,
+        rc['gate_threshold'],
+        rc['gate_temperature'],
+    ), np.nan
 
 
 def train(cfg, method='planning_residual', steps=None, run_name=None, show_progress=True):
@@ -114,13 +123,17 @@ def train(cfg, method='planning_residual', steps=None, run_name=None, show_progr
         wm_cfg.get('uncertainty_penalty', 0.0),
     )
 
-    # Receding-horizon MPC only executes one environment action per step.
-    # Planning residual therefore learns one action-space correction conditioned
-    # on the full MPC chunk and expands it temporally with geometric decay.
+    # Receding-horizon MPC executes only the first action. Planning Residual
+    # conditions on the full short MPC chunk, learns one action-space residual,
+    # and expands it through the chunk with temporal decay.
     k = 1 if method == 'action_residual' else int(rc['chunk_len'])
     residual_dim = act_dim
-    context_dim = obs_dim + k * act_dim
+    # The gate changes how the raw residual maps to the executed action, so the
+    # critic must observe it. Otherwise early ramp and late training create
+    # inconsistent transitions for the same (state, residual) tuple.
+    context_dim = obs_dim + k * act_dim + 1
     temporal_decay = float(rc.get('temporal_decay', 0.8))
+    gate_power = float(rc.get('gate_power', 1.0)) if method == 'planning_residual' else 1.0
 
     agent = None
     rb = None
@@ -181,18 +194,24 @@ def train(cfg, method='planning_residual', steps=None, run_name=None, show_progr
     for step in pbar:
         plan, cache_hit = cache.get_or_plan(obs, planner)
         base = plan_chunk(plan.actions, k)
-        c = context(obs, base)
-        adaptive_gate = 0.0
-        gate_z = np.nan
-        ramp = 0.0
 
         if agent is None:
-            residual = np.zeros(act_dim, dtype=np.float32)
-            residual_chunk = np.zeros_like(base)
+            adaptive_gate = 0.0
+            gate_z = np.nan
+            ramp = 0.0
             effective_gate = 0.0
+            residual = np.zeros(act_dim, dtype=np.float32)
             corrected = base
             effective_delta = np.zeros_like(base)
+            c = None
         else:
+            adaptive_gate, gate_z = _adaptive_gate_for_plan(
+                method, rc, normalized_gate, plan.uncertainty, update=True
+            )
+            ramp = residual_ramp(step, rl_start_local, ramp_steps)
+            effective_gate = gated_strength(adaptive_gate, ramp, gate_power)
+            c = residual_context(obs, base, effective_gate)
+
             residual = agent.act(c).reshape(act_dim)
             if method == 'planning_residual':
                 residual_chunk = expand_temporal_residual(
@@ -201,22 +220,6 @@ def train(cfg, method='planning_residual', steps=None, run_name=None, show_progr
             else:
                 residual_chunk = residual.reshape(1, act_dim)
 
-            if method == 'planning_residual' and rc.get('adaptive_gate', True):
-                if normalized_gate is not None:
-                    gout = normalized_gate(plan.uncertainty)
-                    adaptive_gate = gout.value
-                    gate_z = gout.normalized_uncertainty
-                else:
-                    adaptive_gate = adaptive_uncertainty_gate(
-                        plan.uncertainty,
-                        rc['gate_threshold'],
-                        rc['gate_temperature'],
-                    )
-            else:
-                adaptive_gate = float(rc.get('fixed_gate', 1.0))
-
-            ramp = residual_ramp(step, rl_start_local, ramp_steps)
-            effective_gate = adaptive_gate * ramp
             effective_delta = (
                 effective_gate
                 * float(rc['residual_scale'])
@@ -250,7 +253,12 @@ def train(cfg, method='planning_residual', steps=None, run_name=None, show_progr
             else:
                 nplan = planner.plan(no)
                 nbase = plan_chunk(nplan.actions, k)
-                nc = context(no, nbase)
+                next_adaptive, _ = _adaptive_gate_for_plan(
+                    method, rc, normalized_gate, nplan.uncertainty, update=False
+                )
+                next_ramp = residual_ramp(step + 1, rl_start_local, ramp_steps)
+                next_gate = gated_strength(next_adaptive, next_ramp, gate_power)
+                nc = residual_context(no, nbase, next_gate)
                 cache.put(no, nplan)
             rb.add(c, residual, r, nc, done)
 

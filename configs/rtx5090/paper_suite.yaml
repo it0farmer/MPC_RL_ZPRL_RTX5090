@@ -14,6 +14,7 @@ seeds:
 - 3
 - 4
 steps: 100000
+eval_episodes: 5
 lewm_configs:
 - configs/rtx5090/lewm_hopper.yaml
 - configs/rtx5090/lewm_walker2d.yaml

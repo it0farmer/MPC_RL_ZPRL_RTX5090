@@ -63,5 +63,8 @@ zprl_style:
   bc_collect_steps: 6000
   bc_epochs: 80
   latent_dim: 16
-  residual_ramp_steps: 5000
-  residual_scale: 0.04
+  residual_ramp_steps: 7000
+  residual_scale: 0.035
+  dagger_rounds: 1
+  dagger_steps_per_round: 1000
+  dagger_refit_epochs: 25

@@ -38,6 +38,7 @@ residual:
   gate_z_temperature: 0.75
   gate_min: 0.0
   gate_max: 0.65
+  gate_power: 1.5
   ramp_steps: 5000
   fixed_gate: 1.0
   consistency_coef: 0.1

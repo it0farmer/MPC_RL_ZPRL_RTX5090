@@ -60,11 +60,16 @@ hardware:
   cudnn_benchmark: true
   matmul_precision: high
 zprl_style:
-  bc_collect_steps: 6000
-  bc_epochs: 80
-  latent_dim: 16
-  residual_ramp_steps: 6000
-  residual_scale: 0.04
-  dagger_rounds: 2
-  dagger_steps_per_round: 1500
-  dagger_refit_epochs: 30
+  bc_collect_steps: 12000
+  bc_epochs: 100
+  latent_dim: 32
+  base_hidden_dim: 512
+  base_eval_episodes: 5
+  base_eval_warn_threshold: 0.0
+  residual_start_steps: 3000
+  residual_ramp_steps: 12000
+  residual_scale: 0.03
+  consistency_coef: 0.05
+  dagger_rounds: 3
+  dagger_steps_per_round: 2000
+  dagger_refit_epochs: 40

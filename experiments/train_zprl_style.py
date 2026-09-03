@@ -94,13 +94,7 @@ def _dagger_refine(
     refit_epochs,
     show_progress,
 ):
-    """Small DAgger-style correction for BC covariate shift.
-
-    The learner visits states using its own current base policy, while MPC only
-    labels those visited states. The aggregated dataset is then used to refit
-    the same bottleneck policy. This is intentionally lightweight: it improves
-    coverage without turning ZPRL-style training into full online MPC control.
-    """
+    """Small DAgger-style correction for BC covariate shift."""
     if rounds <= 0 or steps_per_round <= 0:
         return states, targets, np.nan
 
@@ -152,6 +146,71 @@ def _dagger_refine(
             update_obs_stats=True,
         )
     return states, targets, bc_loss
+
+
+def evaluate_base_policy(
+    cfg,
+    base,
+    device,
+    low,
+    high,
+    mid,
+    span,
+    train_seed,
+    episodes,
+    show_progress=True,
+):
+    """Evaluate the frozen behavior-cloned base before residual RL starts."""
+    if episodes <= 0:
+        return []
+
+    rng_state = _save_rng_state()
+    env, _, _ = make_mujoco_env(cfg['env']['id'], train_seed + 15000)
+    rows = []
+    try:
+        ep_iter = _pbar(
+            range(episodes),
+            show_progress,
+            total=episodes,
+            desc=f"base eval {cfg['env']['id']} | seed={train_seed}",
+            leave=False,
+            unit='ep',
+        )
+        for ep in ep_iter:
+            eval_seed = 150000 + train_seed * 1000 + ep
+            obs, _ = env.reset(seed=eval_seed)
+            done = False
+            info = {}
+            em = EpisodeMetrics()
+            while not done:
+                action = _base_action(base, obs, device, mid, span, low, high)
+                no, r, te, tr, info = env.step(action)
+                done = te or tr
+                em.step(
+                    r,
+                    action,
+                    resnorm=0.0,
+                    effective_resnorm=0.0,
+                    gate=0.0,
+                    ramp=0.0,
+                )
+                obs = no
+
+            row = em.finish(info, cfg['env'].get('success_return_threshold'))
+            row.update({
+                'eval_episode': ep,
+                'eval_seed': eval_seed,
+                'train_seed': train_seed,
+                'method': 'zprl_base',
+                'env': cfg['env']['id'],
+            })
+            rows.append(row)
+            if show_progress:
+                ep_iter.set_postfix(ret=f"{row['episode_return']:.1f}", length=row['episode_length'])
+    finally:
+        env.close()
+        _restore_rng_state(rng_state)
+    return rows
 
 
 def evaluate_zprl(
@@ -269,13 +328,20 @@ def main():
     tc = cfg['train']
     zc = cfg.get('zprl_style', {})
     latent_dim = int(args.latent_dim or zc.get('latent_dim', 16))
+    base_hidden_dim = int(zc.get('base_hidden_dim', 256))
     bc_collect_steps = int(args.bc_collect_steps or zc.get('bc_collect_steps', 6000))
     bc_epochs = int(args.bc_epochs or zc.get('bc_epochs', 80))
     latent_residual_scale = float(zc.get('residual_scale', 0.05))
+    latent_residual_start = int(zc.get('residual_start_steps', 1))
     latent_ramp_steps = int(zc.get('residual_ramp_steps', 5000))
     dagger_rounds = int(zc.get('dagger_rounds', 0))
     dagger_steps = int(zc.get('dagger_steps_per_round', 0))
     dagger_epochs = int(zc.get('dagger_refit_epochs', 30))
+    base_eval_episodes = int(zc.get('base_eval_episodes', 3))
+    base_warn_threshold = zc.get('base_eval_warn_threshold')
+    zprl_consistency = float(
+        zc.get('consistency_coef', cfg['residual'].get('consistency_coef', 0.05))
+    )
 
     buf = TransitionReplay(
         max(100000, int(args.steps) + bc_collect_steps + dagger_rounds * dagger_steps + 10000),
@@ -354,7 +420,7 @@ def main():
     targets = np.asarray(bc_targets, dtype=np.float32)
     target_norm = np.clip((targets - mid) / np.maximum(span, 1e-6), -1, 1)
 
-    base = BottleneckBasePolicy(od, ad, latent_dim).to(device)
+    base = BottleneckBasePolicy(od, ad, latent_dim, hidden=base_hidden_dim).to(device)
     bc = fit_behavior_clone(
         base,
         states,
@@ -392,9 +458,51 @@ def main():
         f'dagger={dagger_rounds}x{dagger_steps}'
     )
 
-    # The critic must observe ramp because the executed latent perturbation is
-    # ramp * residual_scale * dz. Omitting it makes the transition model seen
-    # by SAC non-stationary during the ramp-up phase.
+    out = Path(cfg['logging']['root']) / f"{cfg['env']['id']}__zprl_style__seed{seed}__{int(time.time())}"
+    out.mkdir(parents=True, exist_ok=True)
+    save_yaml(cfg, out / 'config.yaml')
+
+    base_rows = evaluate_base_policy(
+        cfg,
+        base,
+        device,
+        low,
+        high,
+        mid,
+        span,
+        seed,
+        base_eval_episodes,
+        show_progress,
+    )
+    base_eval_mean = np.nan
+    if base_rows:
+        base_eval_fields = [
+            'eval_episode', 'eval_seed', 'train_seed', 'method', 'env',
+            'episode_return', 'episode_length', 'success', 'mpc_ms',
+            'prediction_mse', 'uncertainty', 'residual_norm',
+            'effective_residual_norm', 'gate', 'residual_ramp',
+            'action_d1', 'action_d2',
+        ]
+        blog = CSVLogger(str(out / 'base_eval.csv'), base_eval_fields)
+        for row in base_rows:
+            blog.write(row)
+        bvals = np.asarray([r['episode_return'] for r in base_rows], dtype=float)
+        base_eval_mean = float(bvals.mean())
+        base_eval_std = float(bvals.std(ddof=1)) if len(bvals) > 1 else 0.0
+        print(
+            f"BASE_EVAL seed={seed} episodes={len(bvals)} "
+            f"return={base_eval_mean:.3f}±{base_eval_std:.3f}"
+        )
+        if base_warn_threshold is not None and base_eval_mean < float(base_warn_threshold):
+            print(
+                f"WARNING: base policy return {base_eval_mean:.3f} is below "
+                f"configured preflight threshold {float(base_warn_threshold):.3f}; "
+                "treat this run as diagnostic before launching a 100k sweep."
+            )
+
+    # The critic observes ramp because the executed latent perturbation is
+    # ramp * residual_scale * dz. residual_start_steps allows a short pure-base
+    # phase so that a usable clone is not immediately perturbed by an untrained SAC.
     ctx_dim = od + latent_dim + 1
     agent = ResidualSAC(
         ctx_dim,
@@ -405,15 +513,12 @@ def main():
         tau=cfg['sac']['tau'],
         init_alpha=cfg['sac']['init_alpha'],
         target_entropy_scale=cfg['sac']['target_entropy_scale'],
-        consistency_coef=cfg['residual'].get('consistency_coef', 0.05),
+        consistency_coef=zprl_consistency,
         device=device,
         precision=precision,
     )
     rb = ResidualReplay(max(100000, int(args.steps) + 10000), ctx_dim, latent_dim)
 
-    out = Path(cfg['logging']['root']) / f"{cfg['env']['id']}__zprl_style__seed{seed}__{int(time.time())}"
-    out.mkdir(parents=True, exist_ok=True)
-    save_yaml(cfg, out / 'config.yaml')
     fields = [
         'global_step', 'episode', 'method', 'env', 'seed', 'episode_return',
         'episode_length', 'success', 'mpc_ms', 'prediction_mse', 'uncertainty',
@@ -433,7 +538,7 @@ def main():
     )
 
     for step in pbar:
-        ramp = residual_ramp(step, 1, latent_ramp_steps)
+        ramp = residual_ramp(step, latent_residual_start, latent_ramp_steps)
         z = _latent(base, obs, device)
         c = _context(base, obs, z, ramp, device)
         dz = agent.act(c)
@@ -449,7 +554,7 @@ def main():
         if done:
             nc = np.zeros(ctx_dim, np.float32)
         else:
-            next_ramp = residual_ramp(step + 1, 1, latent_ramp_steps)
+            next_ramp = residual_ramp(step + 1, latent_residual_start, latent_ramp_steps)
             nz = _latent(base, no, device)
             nc = _context(base, no, nz, next_ramp, device)
 
@@ -503,6 +608,7 @@ def main():
             'latent_dim': latent_dim,
             'config': cfg,
             'bc_dataset_mse': bc_dataset_mse,
+            'base_eval_return_mean': base_eval_mean,
             'context_dim': ctx_dim,
         },
         out / 'final.pt',

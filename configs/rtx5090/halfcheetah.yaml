@@ -11,7 +11,7 @@ train:
   rl_start_steps: 6000
   rl_updates_per_step: 1
   eval_interval: 5000
-  final_eval_episodes: 3
+  final_eval_episodes: 5
   checkpoint_interval: 10000
 world_model:
   ensemble_size: 7
@@ -60,16 +60,22 @@ hardware:
   cudnn_benchmark: true
   matmul_precision: high
 zprl_style:
-  bc_collect_steps: 12000
-  bc_epochs: 100
+  # HalfCheetah-specific distillation strengthening. The previous 10k run
+  # improved final evaluation from about -282 to -36, but the base clone was
+  # still weak (about -220 return, BC MSE about 0.14) and the residual actor
+  # was close to saturation. These settings spend more compute on a better
+  # frozen base and give the residual policy more authority only after a long
+  # ramp, without changing the common MPC/SAC baselines above.
+  bc_collect_steps: 20000
+  bc_epochs: 140
   latent_dim: 32
-  base_hidden_dim: 512
+  base_hidden_dim: 768
   base_eval_episodes: 5
   base_eval_warn_threshold: 0.0
-  residual_start_steps: 3000
-  residual_ramp_steps: 12000
-  residual_scale: 0.03
-  consistency_coef: 0.05
-  dagger_rounds: 3
-  dagger_steps_per_round: 2000
-  dagger_refit_epochs: 40
+  residual_start_steps: 5000
+  residual_ramp_steps: 20000
+  residual_scale: 0.04
+  consistency_coef: 0.03
+  dagger_rounds: 4
+  dagger_steps_per_round: 2500
+  dagger_refit_epochs: 50

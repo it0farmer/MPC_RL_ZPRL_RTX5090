@@ -62,10 +62,11 @@ run_logged() {
 run_logged python -m unittest discover -s tests -v
 
 methods=(mpc_only action_residual planning_residual zprl_style)
+read -r -a seed_array <<< "$SEEDS"
 job=0
-total=20
+total=$((${#methods[@]} * ${#seed_array[@]}))
 
-for seed in $SEEDS; do
+for seed in "${seed_array[@]}"; do
   for method in "${methods[@]}"; do
     job=$((job + 1))
     if (( job < START_JOB )); then

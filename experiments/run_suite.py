@@ -44,6 +44,7 @@ def build_jobs(suite, include_lewm=False):
                     sys.executable, '-m', 'experiments.train_lewm',
                     '--config', cfg,
                     '--seed', str(seed),
+                    '--episodes', str(eval_episodes),
                 ]
                 jobs.append((env_name, 'lewm_mpc', seed, cmd))
     return jobs
@@ -51,7 +52,7 @@ def build_jobs(suite, include_lewm=False):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--suite', default='configs/paper_suite.yaml')
+    p.add_argument('--suite', default='configs/rtx5090/paper_suite.yaml')
     p.add_argument('--include-lewm', action='store_true')
     p.add_argument(
         '--start-job',

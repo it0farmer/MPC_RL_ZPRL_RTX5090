@@ -2,6 +2,7 @@ env:
   id: Walker2d-v5
   seed: 0
   render_size: 96
+  success_return_threshold: null
 collect:
   transitions: 30000
 lewm:
@@ -24,8 +25,26 @@ mpc:
   init_std: 0.7
   min_std: 0.05
   discount: 0.99
+rl_residual:
+  total_steps: 50000
+  random_steps: 3000
+  start_steps: 3000
+  ramp_steps: 10000
+  residual_scale: 0.08
+  replay_capacity: 100000
+  batch_size: 512
+  hidden_dim: 512
+  lr: 0.0003
+  gamma: 0.99
+  tau: 0.005
+  init_alpha: 0.1
+  target_entropy_scale: 0.7
+  consistency_coef: 0.05
+  updates_per_step: 1
 eval:
   episodes: 10
+logging:
+  root: runs
 hardware:
   profile: RTX 5090 32GB
   precision: bf16

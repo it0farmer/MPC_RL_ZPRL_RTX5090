@@ -31,16 +31,13 @@ def load_runs(root, env_filter=None, method_filter=None):
             continue
         if df.empty or not {'env', 'method', 'seed', 'global_step'}.issubset(df.columns):
             continue
-
         df = df[df['env'].notna() & df['method'].notna() & df['seed'].notna()].copy()
         if df.empty:
             continue
-
         df['global_step'] = pd.to_numeric(df['global_step'], errors='coerce')
         df = df[df['global_step'].notna()]
         if df.empty:
             continue
-
         last = df.iloc[-1]
         env = str(last['env'])
         method = str(last['method'])
@@ -48,7 +45,6 @@ def load_runs(root, env_filter=None, method_filter=None):
             continue
         if method_filter and method not in method_filter:
             continue
-
         run_dir = Path(f).parent
         records.append({
             'path': f,
@@ -128,23 +124,15 @@ def main():
 
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-
     envs = list(dict.fromkeys(a.env or sorted({r['env'] for r in records})))
-    completeness = completeness_table(
-        records, envs, a.methods, a.expected_seeds, a.min_steps
-    )
+    completeness = completeness_table(records, envs, a.methods, a.expected_seeds, a.min_steps)
     completeness_path = out.with_name(out.stem + '_completeness.csv')
     completeness.to_csv(completeness_path, index=False)
 
     missing = completeness.loc[~completeness['complete']]
     if len(missing):
         print('\nIncomplete expected runs:')
-        print(
-            missing[
-                ['env', 'method', 'seed', 'run_found', 'max_step',
-                 'step_complete', 'eval_exists']
-            ].to_string(index=False)
-        )
+        print(missing[['env', 'method', 'seed', 'run_found', 'max_step', 'step_complete', 'eval_exists']].to_string(index=False))
         if a.require_complete:
             raise SystemExit('Experiment is incomplete; final aggregation aborted.')
 
@@ -152,7 +140,7 @@ def main():
         'episode_return', 'success', 'mpc_ms', 'prediction_mse', 'action_d1',
         'action_d2', 'residual_norm', 'effective_residual_norm', 'gate',
         'adaptive_gate', 'gate_z', 'residual_ramp', 'mpc_cache_hit_rate',
-        'episode_length',
+        'safeguard_scale', 'safeguard_gain', 'episode_length',
     ]
     rows = []
     for r in records:
@@ -162,54 +150,27 @@ def main():
             source = 'deterministic_final_eval'
         else:
             if a.require_eval:
-                raise SystemExit(
-                    f"Missing eval.csv for {r['env']} {r['method']} seed={r['seed']}: "
-                    f"{r['run_dir']}"
-                )
+                raise SystemExit(f"Missing eval.csv for {r['env']} {r['method']} seed={r['seed']}: {r['run_dir']}")
             g = r['df'].tail(max(1, int(a.tail))).reset_index(drop=True)
             source = f'training_tail_{max(1, int(a.tail))}'
-
         row = {
-            'env': r['env'],
-            'method': r['method'],
-            'seed': r['seed'],
-            'global_step': r['max_step'],
-            'episodes_used': len(g),
-            'performance_source': source,
-            'run_path': str(r['run_dir']),
+            'env': r['env'], 'method': r['method'], 'seed': r['seed'],
+            'global_step': r['max_step'], 'episodes_used': len(g),
+            'performance_source': source, 'run_path': str(r['run_dir']),
         }
         for col in cols:
-            row[col] = (
-                pd.to_numeric(g[col], errors='coerce').mean()
-                if col in g else np.nan
-            )
+            row[col] = pd.to_numeric(g[col], errors='coerce').mean() if col in g else np.nan
         row['sample_efficiency_step'] = first_success_step(r['df'].reset_index(drop=True))
         rows.append(row)
 
     per_seed = pd.DataFrame(rows).sort_values(['env', 'method', 'seed'])
     per_seed_path = out.with_name(out.stem + '_per_seed.csv')
     per_seed.to_csv(per_seed_path, index=False)
-
-    numeric = [
-        c for c in per_seed.columns
-        if c not in {'env', 'method', 'performance_source', 'run_path'}
-        and pd.api.types.is_numeric_dtype(per_seed[c])
-    ]
-    summary = (
-        per_seed.groupby(['env', 'method'], dropna=False)[numeric]
-        .agg(['mean', 'std'])
-        .reset_index()
-    )
+    numeric = [c for c in per_seed.columns if c not in {'env', 'method', 'performance_source', 'run_path'} and pd.api.types.is_numeric_dtype(per_seed[c])]
+    summary = per_seed.groupby(['env', 'method'], dropna=False)[numeric].agg(['mean', 'std']).reset_index()
     summary.to_csv(out, index=False)
 
-    print(
-        per_seed[
-            [
-                'env', 'method', 'seed', 'global_step',
-                'performance_source', 'episode_return', 'episode_length',
-            ]
-        ].to_string(index=False)
-    )
+    print(per_seed[['env', 'method', 'seed', 'global_step', 'performance_source', 'episode_return', 'episode_length']].to_string(index=False))
     print('\nmean±std summary:\n', summary.to_string(index=False))
     print('saved', out)
     print('saved', per_seed_path)

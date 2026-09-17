@@ -7,6 +7,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib import font_manager
 
 METHODS = ('mpc_only', 'action_residual', 'planning_residual', 'zprl_style')
 LABELS = {
@@ -15,6 +16,13 @@ LABELS = {
     'planning_residual': 'Planning Residual',
     'zprl_style': 'ZPRL-style',
 }
+
+
+def set_style():
+    names = {f.name for f in font_manager.fontManager.ttflist}
+    plt.rcParams['font.family'] = 'Times New Roman' if 'Times New Roman' in names else 'DejaVu Serif'
+    plt.rcParams['font.size'] = 10.5
+    plt.rcParams['axes.unicode_minus'] = False
 
 
 def _num(s):
@@ -43,7 +51,7 @@ def load_summary(path: Path) -> pd.DataFrame:
 def main_return_figures(df: pd.DataFrame, out: Path):
     rows = []
     for env, g in df.groupby('env'):
-        stats = g.groupby('method')['episode_return'].agg(['mean', 'std']).reindex(METHODS)
+        stats = g.groupby('method')['episode_return'].agg(['mean', 'std', 'count']).reindex(METHODS)
         fig, ax = plt.subplots(figsize=(7.2, 4.8))
         x = np.arange(len(METHODS))
         ax.bar(x, stats['mean'].values, yerr=stats['std'].values, capsize=5)
@@ -61,11 +69,15 @@ def main_return_figures(df: pd.DataFrame, out: Path):
         base = float(stats.loc['mpc_only', 'mean'])
         for method in METHODS:
             mean = float(stats.loc[method, 'mean'])
+            std = float(stats.loc[method, 'std'])
+            n = int(stats.loc[method, 'count'])
             rows.append({
                 'env': env,
                 'method': method,
                 'mean_return': mean,
-                'std_return': float(stats.loc[method, 'std']),
+                'std_return': std,
+                'seeds': n,
+                'ci95_half_width': 1.96 * std / np.sqrt(n) if n > 1 else np.nan,
                 'vs_mpc_pct': 100.0 * (mean - base) / max(abs(base), 1e-12),
             })
 
@@ -87,6 +99,42 @@ def main_return_figures(df: pd.DataFrame, out: Path):
     _save(fig, out, 'relative_return_vs_mpc')
 
 
+def paired_planning_delta(df: pd.DataFrame, out: Path):
+    rows = []
+    for env, g in df.groupby('env'):
+        p = g[g.method == 'planning_residual'][['seed', 'episode_return']].rename(
+            columns={'episode_return': 'planning_return'}
+        )
+        b = g[g.method == 'mpc_only'][['seed', 'episode_return']].rename(
+            columns={'episode_return': 'mpc_return'}
+        )
+        q = p.merge(b, on='seed').sort_values('seed')
+        if q.empty:
+            continue
+        q['delta_return'] = q['planning_return'] - q['mpc_return']
+        q['env'] = env
+        rows.append(q)
+
+        values = q.delta_return.to_numpy(float)
+        mean = float(np.mean(values))
+        ci = 1.96 * float(np.std(values, ddof=1)) / np.sqrt(len(values)) if len(values) > 1 else 0.0
+        fig, ax = plt.subplots(figsize=(6.4, 4.2))
+        x = np.arange(len(q))
+        ax.bar(x, values)
+        ax.axhline(0.0, linewidth=1.0)
+        ax.axhline(mean, linestyle='--', linewidth=1.2, label=f'Mean = {mean:.2f}')
+        ax.fill_between([-0.5, len(q) - 0.5], mean - ci, mean + ci, alpha=0.12, label='95% CI of paired mean')
+        ax.set_xticks(x, [f"seed {int(s)}" for s in q.seed])
+        ax.set_ylabel('Planning Residual - MPC return')
+        ax.set_title(f'{env}: paired final-evaluation difference')
+        ax.grid(axis='y', alpha=.25)
+        ax.legend(fontsize=8)
+        _save(fig, out, f'paired_planning_vs_mpc_{env.replace("-v5", "")}')
+
+    if rows:
+        pd.concat(rows, ignore_index=True).to_csv(out / 'paired_planning_vs_mpc.csv', index=False)
+
+
 def diagnostic_figures(df: pd.DataFrame, out: Path):
     metrics = [
         ('prediction_mse', 'One-step prediction MSE'),
@@ -94,6 +142,8 @@ def diagnostic_figures(df: pd.DataFrame, out: Path):
         ('action_d2', 'Second-order action variation'),
         ('effective_residual_norm', 'Effective residual norm'),
         ('gate', 'Effective gate'),
+        ('safeguard_scale', 'Accepted residual scale'),
+        ('safeguard_gain', 'Predicted return gain from safeguard'),
         ('mpc_ms', 'MPC planning time (ms)'),
         ('episode_length', 'Episode length'),
     ]
@@ -101,7 +151,7 @@ def diagnostic_figures(df: pd.DataFrame, out: Path):
     x = np.arange(len(envs))
     width = 0.18
     for metric, ylabel in metrics:
-        if metric not in df.columns:
+        if metric not in df.columns or not pd.to_numeric(df[metric], errors='coerce').notna().any():
             continue
         fig, ax = plt.subplots(figsize=(8.0, 4.8))
         for j, method in enumerate(METHODS):
@@ -168,7 +218,7 @@ def learning_curves(root: Path, out: Path, smooth_episodes: int = 20, grid_n: in
             for q in selected:
                 x = q.global_step.to_numpy(float)
                 y = q.smooth.to_numpy(float)
-                curves.append(np.interp(grid, x, y, left=np.nan, right=y[-1]))
+                curves.append(np.interp(grid, x, y, left=y[0], right=y[-1]))
             a = np.asarray(curves, dtype=float)
             mean = np.nanmean(a, axis=0)
             std = np.nanstd(a, axis=0, ddof=1) if a.shape[0] > 1 else np.zeros_like(mean)
@@ -185,6 +235,37 @@ def learning_curves(root: Path, out: Path, smooth_episodes: int = 20, grid_n: in
         else:
             plt.close(fig)
 
+    auc_rows = []
+    for d in runs:
+        last = d.iloc[-1]
+        q = d.sort_values('global_step')[['global_step', 'episode_return']].copy()
+        q['smooth'] = q.episode_return.rolling(smooth_episodes, min_periods=1).mean()
+        x = q.global_step.to_numpy(float)
+        y = q.smooth.to_numpy(float)
+        if len(x) < 2 or x[-1] <= 0:
+            continue
+        xnorm = x / x[-1]
+        auc_rows.append({
+            'env': str(last.env),
+            'method': str(last.method),
+            'seed': int(float(last.seed)),
+            'learning_curve_auc': float(np.trapezoid(np.r_[y[0], y], np.r_[0.0, xnorm])),
+            'max_step': float(x[-1]),
+        })
+    if auc_rows:
+        auc_df = pd.DataFrame(auc_rows)
+        auc_df.to_csv(out / 'sample_efficiency_auc.csv', index=False)
+        for env, g in auc_df.groupby('env'):
+            stats = g.groupby('method')['learning_curve_auc'].agg(['mean', 'std']).reindex(METHODS)
+            fig, ax = plt.subplots(figsize=(7.2, 4.8))
+            x = np.arange(len(METHODS))
+            ax.bar(x, stats['mean'], yerr=stats['std'].fillna(0), capsize=5)
+            ax.set_xticks(x, [LABELS[m] for m in METHODS], rotation=15, ha='right')
+            ax.set_ylabel('Learning-curve AUC (same step budget)')
+            ax.set_title(f'{env}: sample efficiency')
+            ax.grid(axis='y', alpha=.25)
+            _save(fig, out, f'sample_efficiency_{env.replace("-v5", "")}')
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -194,10 +275,12 @@ def main():
     p.add_argument('--smooth-episodes', type=int, default=20)
     a = p.parse_args()
 
+    set_style()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     df = load_summary(Path(a.summary))
     main_return_figures(df, out)
+    paired_planning_delta(df, out)
     diagnostic_figures(df, out)
     learning_curves(Path(a.runs), out, a.smooth_episodes)
     print('paper figures saved to', out)

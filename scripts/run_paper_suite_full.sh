@@ -75,7 +75,6 @@ ALL_METHODS=(mpc_only action_residual planning_residual zprl_style lewm_mpc)
 ENV_ARGS=()
 for env in "${ENVS[@]}"; do ENV_ARGS+=(--env "$env"); done
 
-# Main 4-method 100k comparison with strict completeness.
 run_logged python -m experiments.aggregate \
   --root "$RUN_ROOT" \
   --out "${RESULT_ROOT}/main_summary.csv" \
@@ -87,9 +86,6 @@ run_logged python -m experiments.aggregate \
   --require-complete \
   --tail 20
 
-# Deterministic final comparison including the LeWM engineering baseline.
-# min-steps is intentionally 0 because LeWM is trained offline on a fixed
-# transition set and its episodes.csv global_step counts evaluation steps only.
 run_logged python -m experiments.summarize_eval \
   --root "$RUN_ROOT" \
   --out "${RESULT_ROOT}/final_eval" \
@@ -99,7 +95,6 @@ run_logged python -m experiments.summarize_eval \
   --expected-seeds 0 1 2 3 4 \
   --require-complete
 
-# Training curves are meaningful for the online 100k methods only.
 run_logged python -m experiments.plot_results \
   --root "$RUN_ROOT" \
   --outdir "${RESULT_ROOT}/figures" \
@@ -113,9 +108,16 @@ run_logged python -m experiments.plot_results \
   --points 400 \
   --error-band std
 
+run_logged python -m experiments.paper_figures \
+  --summary "${RESULT_ROOT}/main_summary_per_seed.csv" \
+  --runs "$RUN_ROOT" \
+  --out "${RESULT_ROOT}/paper_figures" \
+  --smooth-episodes 20
+
 echo
 echo "Paper suite completed."
-echo "Runs:       $RUN_ROOT"
-echo "Results:    $RESULT_ROOT"
-echo "Comparison: $RESULT_ROOT/final_eval/comparison_eval.csv"
-echo "Figures:    $RESULT_ROOT/figures"
+echo "Runs:          $RUN_ROOT"
+echo "Results:       $RESULT_ROOT"
+echo "Comparison:    $RESULT_ROOT/final_eval/comparison_eval.csv"
+echo "Figures:       $RESULT_ROOT/figures"
+echo "Paper figures: $RESULT_ROOT/paper_figures"

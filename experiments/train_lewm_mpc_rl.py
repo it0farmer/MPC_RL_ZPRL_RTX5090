@@ -19,6 +19,7 @@ from mpcrl.lewm_rl import (
     effective_rank,
     normalize_action,
     residual_ramp,
+    safeguard_action_residual,
 )
 from mpcrl.metrics import CSVLogger, EpisodeMetrics
 from mpcrl.replay import ResidualReplay
@@ -193,13 +194,56 @@ def build_planner(cfg, model, probe, low, high, device, precision):
     )
 
 
+def _apply_residual_with_optional_safeguard(
+    planner,
+    frame,
+    plan,
+    raw_residual,
+    low,
+    high,
+    rlcfg,
+    ramp,
+):
+    residual_scale = float(rlcfg.get('residual_scale', 0.0))
+    if rlcfg.get('model_safeguard', False):
+        result = safeguard_action_residual(
+            planner,
+            frame,
+            plan.actions,
+            raw_residual,
+            low,
+            high,
+            residual_scale,
+            ramp=ramp,
+            scales=rlcfg.get('safeguard_scales', [1.0, 0.5, 0.25, 0.0]),
+            min_improvement=rlcfg.get('safeguard_min_improvement', 0.0),
+        )
+        return (
+            result.action,
+            result.effective_residual,
+            result.scale,
+            result.predicted_gain,
+        )
+
+    action, effective = apply_action_residual(
+        plan.actions[0],
+        raw_residual,
+        low,
+        high,
+        residual_scale,
+        ramp=ramp,
+    )
+    return action, effective, np.nan, np.nan
+
+
 def make_eval_logger(out_dir):
     fields = [
         'eval_episode', 'eval_seed', 'train_seed', 'method', 'env',
         'episode_return', 'episode_length', 'success', 'mpc_ms',
         'prediction_mse', 'uncertainty', 'residual_norm',
         'effective_residual_norm', 'gate', 'residual_ramp',
-        'action_d1', 'action_d2', 'effective_rank',
+        'safeguard_scale', 'safeguard_gain', 'action_d1', 'action_d2',
+        'effective_rank',
     ]
     return CSVLogger(str(Path(out_dir) / 'eval.csv'), fields)
 
@@ -222,7 +266,6 @@ def evaluate_controller(
     eval_log = make_eval_logger(out_dir)
     size = int(cfg['env']['render_size'])
     rlcfg = cfg.get('rl_residual', {})
-    residual_scale = float(rlcfg.get('residual_scale', 0.0))
     returns = []
     successes = []
 
@@ -246,6 +289,8 @@ def evaluate_controller(
                 action = base_action
                 effective = np.zeros_like(base_action, dtype=np.float32)
                 ramp = 0.0
+                safeguard_scale = np.nan
+                safeguard_gain = np.nan
             else:
                 z = encode_one(model, frame, device)
                 context = np.concatenate(
@@ -253,13 +298,10 @@ def evaluate_controller(
                 ).astype(np.float32)
                 raw_residual = agent.act(context, deterministic=True).astype(np.float32)
                 ramp = 1.0
-                action, effective = apply_action_residual(
-                    base_action,
-                    raw_residual,
-                    low,
-                    high,
-                    residual_scale,
-                    ramp=1.0,
+                action, effective, safeguard_scale, safeguard_gain = (
+                    _apply_residual_with_optional_safeguard(
+                        planner, frame, plan, raw_residual, low, high, rlcfg, ramp
+                    )
                 )
 
             _, reward, terminated, truncated, info = env.step(action)
@@ -271,6 +313,8 @@ def evaluate_controller(
                 gate=ramp,
                 ramp=ramp,
                 effective_resnorm=float(np.linalg.norm(effective)),
+                safeguard_scale=safeguard_scale,
+                safeguard_gain=safeguard_gain,
             )
             if terminated or truncated:
                 break
@@ -328,7 +372,6 @@ def train_residual_controller(
     random_steps = int(rlcfg.get('random_steps', 3000))
     start_steps = int(rlcfg.get('start_steps', random_steps))
     ramp_steps = int(rlcfg.get('ramp_steps', 10000))
-    residual_scale = float(rlcfg.get('residual_scale', 0.1))
     updates_per_step = int(rlcfg.get('updates_per_step', 1))
 
     agent = ResidualSAC(
@@ -354,7 +397,8 @@ def train_residual_controller(
         'global_step', 'episode', 'method', 'env', 'seed', 'episode_return',
         'episode_length', 'success', 'mpc_ms', 'prediction_mse', 'uncertainty',
         'residual_norm', 'effective_residual_norm', 'gate', 'residual_ramp',
-        'action_d1', 'action_d2', 'q_loss', 'actor_loss', 'alpha',
+        'safeguard_scale', 'safeguard_gain', 'action_d1', 'action_d2',
+        'q_loss', 'actor_loss', 'alpha',
     ]
     episode_log = CSVLogger(str(Path(out_dir) / 'episodes.csv'), episode_fields)
 
@@ -385,13 +429,10 @@ def train_residual_controller(
                 raw_residual = agent.act(context, deterministic=False).astype(np.float32)
 
             ramp = residual_ramp(global_step, start_steps, ramp_steps)
-            action, effective = apply_action_residual(
-                base_action,
-                raw_residual,
-                low,
-                high,
-                residual_scale,
-                ramp=ramp,
+            action, effective, safeguard_scale, safeguard_gain = (
+                _apply_residual_with_optional_safeguard(
+                    planner, frame, plan, raw_residual, low, high, rlcfg, ramp
+                )
             )
 
             _, reward, terminated, truncated, info = env.step(action)
@@ -406,6 +447,8 @@ def train_residual_controller(
                 gate=ramp,
                 ramp=ramp,
                 effective_resnorm=float(np.linalg.norm(effective)),
+                safeguard_scale=safeguard_scale,
+                safeguard_gain=safeguard_gain,
             )
 
             if done:
@@ -450,7 +493,8 @@ def train_residual_controller(
                 print(
                     f"RL step={global_step}/{total_steps} episode={episode} "
                     f"return={metrics['episode_return']:.3f} "
-                    f"ramp={ramp:.3f} eff_res={metrics['effective_residual_norm']:.4f}"
+                    f"ramp={ramp:.3f} eff_res={metrics['effective_residual_norm']:.4f} "
+                    f"safe={metrics['safeguard_scale']:.3f}"
                 )
                 episode += 1
                 break
@@ -493,6 +537,10 @@ def main():
         raise SystemExit(
             'Config is missing rl_residual. Pull the latest RTX5090 LeWM configs.'
         )
+    rlcfg = cfg['rl_residual']
+    rlcfg.setdefault('model_safeguard', True)
+    rlcfg.setdefault('safeguard_scales', [1.0, 0.5, 0.25, 0.0])
+    rlcfg.setdefault('safeguard_min_improvement', 0.0)
 
     set_seed(seed)
     hw = cfg.get('hardware', {})
@@ -544,8 +592,6 @@ def main():
         rl_out / 'representation.csv', cfg, seed, diag, probe_mse
     )
 
-    # A minimal episodes.csv is useful for generic run discovery. Baseline has
-    # no online learning, so global_step=0 is intentional.
     base_episode_log = CSVLogger(
         str(base_out / 'episodes.csv'),
         ['global_step', 'episode', 'method', 'env', 'seed', 'episode_return', 'episode_length'],
@@ -562,53 +608,21 @@ def main():
 
     print('\n=== Stage 3/5: evaluate frozen LeWM-MPC baseline ===')
     base_eval = evaluate_controller(
-        env,
-        cfg,
-        planner,
-        model,
-        device,
-        low,
-        high,
-        seed,
-        n_eval,
-        'lewm_mpc',
-        base_out,
-        diag['effective_rank'],
-        agent=None,
+        env, cfg, planner, model, device, low, high, seed, n_eval,
+        'lewm_mpc', base_out, diag['effective_rank'], agent=None,
     )
 
     print('\n=== Stage 4/5: train RL residual at the MPC action stage ===')
-    # Re-seed before controller learning. LeWM/probe remain frozen.
     set_seed(seed + 12345)
     agent = train_residual_controller(
-        env,
-        cfg,
-        planner,
-        model,
-        device,
-        precision,
-        low,
-        high,
-        seed,
-        rl_out,
+        env, cfg, planner, model, device, precision, low, high, seed, rl_out,
         steps_override=args.rl_steps,
     )
 
     print('\n=== Stage 5/5: evaluate LeWM-MPC+RL on identical eval seeds ===')
     rl_eval = evaluate_controller(
-        env,
-        cfg,
-        planner,
-        model,
-        device,
-        low,
-        high,
-        seed,
-        n_eval,
-        'lewm_mpc_rl',
-        rl_out,
-        diag['effective_rank'],
-        agent=agent,
+        env, cfg, planner, model, device, low, high, seed, n_eval,
+        'lewm_mpc_rl', rl_out, diag['effective_rank'], agent=agent,
     )
 
     delta = rl_eval['return_mean'] - base_eval['return_mean']
@@ -630,6 +644,7 @@ def main():
         'success_rate_delta': success_delta,
         'effective_rank': diag['effective_rank'],
         'shared_world_model': True,
+        'model_safeguard': bool(cfg['rl_residual'].get('model_safeguard', False)),
         'rl_steps': int(args.rl_steps or cfg['rl_residual']['total_steps']),
     }
     with open(rl_out / 'pair_summary.json', 'w', encoding='utf-8') as f:

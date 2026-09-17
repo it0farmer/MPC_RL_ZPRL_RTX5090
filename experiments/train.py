@@ -16,7 +16,7 @@ from mpcrl.envs import action_bounds, dims, make_mujoco_env
 from mpcrl.gate import adaptive_uncertainty_gate, make_uncertainty_gate, residual_ramp
 from mpcrl.metrics import CSVLogger, EpisodeMetrics
 from mpcrl.plan_cache import PlanCache
-from mpcrl.planning_residual import expand_temporal_residual
+from mpcrl.planning_residual import expand_temporal_residual, safeguard_residual_plan
 from mpcrl.replay import ResidualReplay, TransitionReplay
 from mpcrl.residual_context import gated_strength, residual_context
 from mpcrl.sac import ResidualSAC
@@ -87,6 +87,37 @@ def _restore_rng_state(state):
         torch.cuda.set_rng_state_all(state['torch_cuda'])
 
 
+def _apply_planning_safeguard(
+    cfg,
+    wm,
+    obs,
+    plan,
+    base,
+    proposed_delta,
+    low,
+    high,
+):
+    rc = cfg['residual']
+    if not rc.get('model_safeguard', False):
+        return base + proposed_delta, proposed_delta, np.nan, np.nan
+
+    sg = safeguard_residual_plan(
+        wm,
+        obs,
+        plan.actions,
+        proposed_delta,
+        low,
+        high,
+        discount=cfg['mpc']['discount'],
+        uncertainty_penalty=cfg['world_model'].get('uncertainty_penalty', 0.0),
+        scales=rc.get('safeguard_scales', [1.0, 0.5, 0.25, 0.0]),
+        min_improvement=rc.get('safeguard_min_improvement', 0.0),
+    )
+    corrected = sg.corrected_plan[:len(base)]
+    actual_delta = corrected - base
+    return corrected, actual_delta, sg.scale, sg.predicted_gain
+
+
 def evaluate_final(
     cfg,
     method,
@@ -148,6 +179,8 @@ def evaluate_final(
             while not done:
                 plan = eval_planner.plan(obs)
                 base = plan_chunk(plan.actions, k)
+                safeguard_scale = np.nan
+                safeguard_gain = np.nan
 
                 if agent is None:
                     adaptive_gate = 0.0
@@ -171,13 +204,21 @@ def evaluate_final(
                     else:
                         residual_chunk = residual.reshape(1, act_dim)
 
-                    effective_delta = (
+                    proposed_delta = (
                         effective_gate
                         * float(rc['residual_scale'])
                         * residual_chunk
                         * span[None, :]
                     )
-                    corrected = base + effective_delta
+                    if method == 'planning_residual':
+                        corrected, effective_delta, safeguard_scale, safeguard_gain = (
+                            _apply_planning_safeguard(
+                                cfg, wm, obs, plan, base, proposed_delta, low, high
+                            )
+                        )
+                    else:
+                        effective_delta = proposed_delta
+                        corrected = base + effective_delta
 
                 action = np.clip(corrected[0], low, high)
                 no, r, term, trunc, info = eval_env.step(action)
@@ -202,6 +243,8 @@ def evaluate_final(
                     ramp=1.0 if agent is not None else 0.0,
                     effective_resnorm=float(np.linalg.norm(effective_delta)),
                     cache_hit=np.nan,
+                    safeguard_scale=safeguard_scale,
+                    safeguard_gain=safeguard_gain,
                 )
                 obs = no
 
@@ -250,6 +293,9 @@ def train(
     wm_cfg = cfg['world_model']
     mp = cfg['mpc']
     rc = cfg['residual']
+    rc.setdefault('model_safeguard', True)
+    rc.setdefault('safeguard_scales', [1.0, 0.5, 0.25, 0.0])
+    rc.setdefault('safeguard_min_improvement', 0.0)
     sc = cfg['sac']
 
     wm = EnsembleWorldModel(
@@ -332,8 +378,8 @@ def train(
         'episode_return', 'episode_length', 'success', 'mpc_ms',
         'prediction_mse', 'uncertainty', 'residual_norm',
         'effective_residual_norm', 'gate', 'adaptive_gate', 'gate_z',
-        'residual_ramp', 'mpc_cache_hit_rate', 'action_d1', 'action_d2',
-        'wm_loss',
+        'residual_ramp', 'mpc_cache_hit_rate', 'safeguard_scale',
+        'safeguard_gain', 'action_d1', 'action_d2', 'wm_loss',
     ]
     logger = CSVLogger(str(out / 'episodes.csv'), fields)
     metrics = EpisodeMetrics()
@@ -353,6 +399,8 @@ def train(
     for step in pbar:
         plan, cache_hit = cache.get_or_plan(obs, planner)
         base = plan_chunk(plan.actions, k)
+        safeguard_scale = np.nan
+        safeguard_gain = np.nan
 
         if agent is None:
             adaptive_gate = 0.0
@@ -379,13 +427,21 @@ def train(
             else:
                 residual_chunk = residual.reshape(1, act_dim)
 
-            effective_delta = (
+            proposed_delta = (
                 effective_gate
                 * float(rc['residual_scale'])
                 * residual_chunk
                 * span[None, :]
             )
-            corrected = base + effective_delta
+            if method == 'planning_residual':
+                corrected, effective_delta, safeguard_scale, safeguard_gain = (
+                    _apply_planning_safeguard(
+                        cfg, wm, obs, plan, base, proposed_delta, low, high
+                    )
+                )
+            else:
+                effective_delta = proposed_delta
+                corrected = base + effective_delta
 
         action = np.clip(corrected[0], low, high)
         no, r, term, trunc, info = env.step(action)
@@ -434,6 +490,8 @@ def train(
             ramp=ramp,
             effective_resnorm=float(np.linalg.norm(effective_delta)),
             cache_hit=cache_hit,
+            safeguard_scale=safeguard_scale,
+            safeguard_gain=safeguard_gain,
         )
 
         if agent is not None and rb.size >= int(tc['batch_size']) and step >= rl_start_local:
@@ -464,6 +522,7 @@ def train(
                     'len': int(row['episode_length']),
                     'wm': f"{wm_loss:.4f}",
                     'gate': f"{row['gate']:.2f}" if np.isfinite(row['gate']) else 'nan',
+                    'safe': f"{row['safeguard_scale']:.2f}" if np.isfinite(row['safeguard_scale']) else 'nan',
                     'cache': f"{row['mpc_cache_hit_rate']:.2f}" if np.isfinite(row['mpc_cache_hit_rate']) else 'nan',
                 })
                 if episode % console_every == 0:
@@ -499,7 +558,8 @@ def train(
             'episode_return', 'episode_length', 'success', 'mpc_ms',
             'prediction_mse', 'uncertainty', 'residual_norm',
             'effective_residual_norm', 'gate', 'adaptive_gate', 'gate_z',
-            'residual_ramp', 'action_d1', 'action_d2',
+            'residual_ramp', 'safeguard_scale', 'safeguard_gain',
+            'action_d1', 'action_d2',
         ]
         eval_logger = CSVLogger(str(out / 'eval.csv'), eval_fields)
         for row in eval_rows:
